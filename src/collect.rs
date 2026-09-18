@@ -66,6 +66,7 @@ const SKIP_FSTYPES: &[&str] = &[
     "efivarfs",
     "nsfs",
     "overlay",
+    "ecryptfs",
     "fuse",
     "rpc_pipefs",
     // Remote storage. `//server/share` passes the device check that excludes
@@ -829,6 +830,7 @@ mod tests {
              none /mnt/scratch ext4 rw 0 0\n\
              /dev/vda1 /var/lib/bind ext4 rw 0 0\n\
              overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0\n\
+             /home/.ecryptfs/u/.Private /home/u ecryptfs rw 0 0\n\
              /dev/vdb1 /data xfs rw 0 0\n\
              /mnt/disk1:/mnt/disk2 /pool fuse.mergerfs rw 0 0\n\
              //nas/backup /mnt/nas cifs rw 0 0\n\
@@ -843,7 +845,10 @@ mod tests {
         // that pass for a device while holding either remote storage or a second
         // view of mounts already counted. Only the fstype list excludes those,
         // and only `fuse` as a whole covers the pool. A block device behind a
-        // fuse driver mounts as `fuseblk` and still counts.
+        // fuse driver mounts as `fuseblk` and still counts. The ecryptfs row is
+        // a fourth: a stacked mount whose source is a directory on the filesystem
+        // beneath it, so it passes the device check and carries a source of its
+        // own past the dedup, while statvfs reports that filesystem again.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
     }
 
