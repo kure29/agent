@@ -13,7 +13,18 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+        # The architectures the hub serves and the installer asks for. The
+        # name here is the asset name, so it must match the mapping in the hub's
+        # src/main.rs: a router's armv7l is the musleabihf triple, armv6l the
+        # arm-unknown one. mips and loongarch are absent on purpose: the TLS
+        # backend has no code for them, so there is nothing to build rather than
+        # a missing entry to fill in.
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+          - arm-unknown-linux-musleabihf
+          - i686-unknown-linux-musl
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

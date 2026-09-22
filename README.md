@@ -20,8 +20,9 @@
 curl -fsSL https://your-hub/install.sh | sh -s -- --server https://your-hub --token <token>
 ```
 
-安装脚本识别 systemd 与 OpenRC，二进制装到 `/opt/monitor/monitor-agent`，token 写入
-`/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。
+安装脚本识别 systemd、OpenRC 与 OpenWrt 的 procd，二进制装到 `/opt/monitor/monitor-agent`，token 写入
+`/opt/monitor/agent.env`（0600）——和 hub 同一个目录，那台机器上只有这一处要看。群晖也在这一条路
+上：DSM 7 的 systemd 是 219，unit 里不能用它不认识的键；DSM 没有 useradd，服务就以 root 运行。
 
 ## 运行
 
