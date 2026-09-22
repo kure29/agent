@@ -7,7 +7,7 @@
 ## 特性
 
 - 直接读 `/proc`、`/sys/class/net` 与 `statvfs`，不依赖 sysinfo
-- 内存对齐 `free(1)` 的 used 列，磁盘对齐 `df(1)` 的 Used 列
+- 内存对齐 `free(1)` 的 used 列，磁盘对齐 `df(1)` 的 Used 列（群晖例外，见下）
 - 无状态：不写文件，不保存跨重启的数据，流量累加由 hub 负责
 - token 走 `Authorization` 头，不进反向代理的 access log
 - 非回环地址拒绝明文 `ws://`
@@ -44,6 +44,10 @@ monitor-agent --server https://your-hub --token <token>
 和容器 veth 同样认得出。PPPoE 只认 OpenWrt 的 `pppoe-wan`：pppd 拨号的
 `ppp0` 默认照计，因为 LTE 拨号时它是唯一的链路，用 pppd 拨 PPPoE 的机器要用 `--iface` 指定。
 
+群晖 DSM 7 打开 Open vSwitch 时，本机地址会落在 `ovs_eth0` 这类内部端口上，物理口变成它的端口：
+内部端口和 `ovs-system` 都不计，只计物理口，因为线上的字节只有物理口那一份。OpenWrt 镜像带起来的
+`dummy0` 同样不计，它哪儿也不去。
+
 转发流量的机器（软路由、桥接了软路由的宿主机）上，同一个包会经过两块真网卡，哪块面向运营商只有
 使用者知道，这时用 `--iface`：
 
@@ -57,13 +61,16 @@ monitor-agent --server https://your-hub --token <token>
 
 ## 上报字段
 
+磁盘总量是所有真实文件系统之和，群晖除外：DSM 的 `/` 是几 GB 的系统分区，装着系统和套件，同型号机器上都一样，也不是放数据的地方，所以不计入，只计 `/volumeN` 这些卷。别的机器上 `/` 就是它的存储，照旧计入。
+
 `src/collect.rs` 中的 `Facts` 与 `Metrics` 两个 struct 直接序列化为线上 JSON，是字段的权威定义。
 
-- **`Facts`** 连接时上报一次：主机名、系统、内核、架构、虚拟化类型、CPU 型号与核数、内存与磁盘总量、本机 IPv4 / IPv6（每族一个，公网地址优先；IPv6 不取临时地址和已废弃地址）
+- **`Facts`** 连接时上报一次：主机名、系统、内核、架构、虚拟化类型、CPU 型号与核数、内存与磁盘总量、本机 IPv4 / IPv6（每族一个，公网地址优先；IPv6 不取临时地址和已废弃地址）。系统名优先取 `/etc/os-release`，群晖没有这个文件，改取 `/etc/VERSION`（面板上显示 `Synology DSM 7.3`）；CPU 型号按架构取 x86 的 `model name`、ARM 的 `Processor` / `Hardware`，都没有时取 `/proc/device-tree/model`，群晖 ARM 机型只有这一个
 - **`Metrics`** 每 `--interval` 秒上报：CPU、负载、内存、swap、磁盘、网卡收发速率与内核累计计数器、TCP / UDP 连接数、进程数、运行时间
 
 `net_rx_total` / `net_tx_total` 为所计网卡的内核 lifetime 计数器之和，原样上报；`boot_id` 取自
-`/proc/sys/kernel/random/boot_id`，后接 `/` 与所计网卡集合的摘要，标明这两个读数在哪段区间内可以相减，
+`/proc/sys/kernel/random/boot_id`（读不到时退化为 `/proc/stat` 的 `btime`，否则重启后计数器归零会被当成流量），
+后接 `/` 与所计网卡集合的摘要，标明这两个读数在哪段区间内可以相减，
 是 hub 判定计数器重新开始的唯一依据，**不要删**。`iface` 回报当前的 `--iface`，供面板显示与预填。
 
 连接 hub 时逐个尝试解析出的地址，除最后一个外每个限 5 秒。网卡上只有内网 IPv4（NAT）时先连 hub 的

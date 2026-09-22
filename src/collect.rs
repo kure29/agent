@@ -22,6 +22,10 @@ use serde::Serialize;
 /// each, idle, wherever the GRE module is loaded. `lxc` and `cilium` are
 /// Cilium's pod veths and host devices, one veth per pod.
 ///
+/// `dummy` is the dummy driver's device, which OpenWrt's images bring up as
+/// `dummy0`; it carries nothing anywhere, so it is neither this machine's
+/// traffic nor a place an address of it would be reported from.
+///
 /// ponytail: a name list, so a GRE tap, or a tap or veth that is no bridge's
 /// port, under a new name will be missed. Nothing in the kernel separates one
 /// from a container's only link -- an LXC guest's veth, the tap of a rootless
@@ -47,6 +51,7 @@ const SKIP_IFACES: &[&str] = &[
     "fwpr",
     "fwln",
     "ifb",
+    "dummy",
     "gretap",
     "erspan",
     "kube",
@@ -277,10 +282,7 @@ impl Collector {
         let dev = fs::read_to_string("/proc/net/dev").unwrap_or_default();
         let counted = self.counted(&dev);
         let (rx_total, tx_total) = totals(&counted);
-        let boot_id = epoch(
-            &read_trim("/proc/sys/kernel/random/boot_id").unwrap_or_default(),
-            counted.iter().map(|(name, ..)| *name),
-        );
+        let boot_id = epoch(&boot_id(), counted.iter().map(|(name, ..)| *name));
         let (rx, tx) = self.net_rate(&counted, Instant::now());
         let (tcp, udp) = conn_counts();
 
@@ -348,6 +350,28 @@ impl Collector {
 
 fn read_trim(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_owned())
+}
+
+/// The kernel's boot id, or the boot time when that file is unreadable.
+///
+/// [`epoch`] is what tells the hub two readings of a lifetime counter may be
+/// subtracted. An empty boot id would leave the epoch a constant across
+/// reboots, so the hub would book a counter that restarted at zero as traffic
+/// rather than re-baselining. `btime` is the weaker source -- it moves when the
+/// clock is set, which a boot id never does -- and is therefore only the
+/// fallback.
+fn boot_id() -> String {
+    match read_trim("/proc/sys/kernel/random/boot_id") {
+        Some(id) if !id.is_empty() => id,
+        _ => parse_btime(&fs::read_to_string("/proc/stat").unwrap_or_default())
+            .map(|t| t.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// The `btime` line of /proc/stat: seconds since the epoch at boot.
+fn parse_btime(text: &str) -> Option<u64> {
+    text.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
 }
 
 /// Parses /proc/meminfo into bytes keyed by field name.
@@ -548,8 +572,23 @@ fn skip_iface(name: &str) -> bool {
 /// often sits -- `vmbr0` on Proxmox, `bond0` where two ports form one link,
 /// `pppoe-wan` on a router -- and whether bytes were already counted says
 /// nothing about address ownership.
+///
+/// `ovs` is the same rule for Open vSwitch, which Synology DSM 7 brings up
+/// around the physical NICs: the host's address moves to the datapath's
+/// internal port (`ovs_eth0`, `ovs-system`) while `eth0` becomes one of its
+/// ports. Both are netdevs in /proc/net/dev and both count the same bytes,
+/// and the kernel offers nothing for [`counted_elsewhere`] to read -- an OVS
+/// port is no Linux bridge's port, has no `lower_*` link and sets no DEVTYPE.
+/// The physical port underneath is what the wire carries, so these are the
+/// second copy. They belong here rather than in [`SKIP_IFACES`] because the
+/// machine's own address is exactly what the internal port holds: dropping it
+/// there would leave such a host with no address at all.
+///
+/// ponytail: a name rule, so a datapath renamed away from the `ovs` prefix is
+/// missed, and no machine with Open vSwitch has been available to confirm the
+/// counters behave as read here. Both are why `--iface` exists.
 fn is_stacked(name: &str) -> bool {
-    name.contains('.') || ["bond", "br", "vlan", "vmbr", "pppoe-"].iter().any(|p| name.starts_with(p))
+    name.contains('.') || ["bond", "br", "vlan", "vmbr", "pppoe-", "ovs"].iter().any(|p| name.starts_with(p))
 }
 
 const SYS_NET: &str = "/sys/class/net";
@@ -628,7 +667,30 @@ fn skip_fstype(fstype: &str) -> bool {
 /// later stays invisible until the agent restarts. /proc/self/mounts is a few
 /// kilobytes.
 fn real_mount_points() -> Vec<String> {
-    parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default())
+    storage_mounts(parse_mounts(&fs::read_to_string("/proc/self/mounts").unwrap_or_default()), is_synology())
+}
+
+/// [`parse_mounts`], less the filesystems that are not this machine's storage.
+///
+/// `synology` drops the mount at `/`: on DSM that is the system partition, a
+/// fixed image of a few gigabytes holding the OS and its packages, the same on
+/// every machine of the model and never where its owner's data lives. Counting
+/// it puts the panel above what DSM itself reports as the volumes' usage -- by
+/// the whole 8 GiB on a DS223j, of which 1.3 GiB is always in use. The volumes
+/// are separate mounts under /volume1 and are counted as before, and a machine
+/// whose storage really is its root is not a Synology.
+fn storage_mounts(mounts: Vec<String>, synology: bool) -> Vec<String> {
+    if !synology {
+        return mounts;
+    }
+    mounts.into_iter().filter(|m| m != "/").collect()
+}
+
+/// Whether this host runs DSM. `/usr/syno` is where Synology keeps its own
+/// tools -- a DS223j holds `/usr/syno/bin/synosystemctl` there -- and no other
+/// system provides it.
+fn is_synology() -> bool {
+    Path::new("/usr/syno").is_dir()
 }
 
 fn mount_rows(text: &str) -> Vec<(&str, &str, &str)> {
@@ -759,24 +821,79 @@ fn proc_count() -> u32 {
 
 fn cpuinfo() -> (String, u32) {
     let text = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    let name = text
-        .lines()
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            matches!(k.trim(), "model name" | "Model" | "cpu model").then(|| v.trim().to_owned())
-        })
+    let name = parse_cpu_name(&text)
+        .or_else(|| read_trim(DEVICE_TREE_MODEL).map(|m| m.trim_matches('\0').to_owned()))
+        .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "unknown".into());
     let cores = text.lines().filter(|l| l.starts_with("processor")).count().max(1) as u32;
     (name, cores)
 }
 
-fn os_pretty_name() -> String {
-    fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|t| {
-            t.lines().find_map(|l| Some(l.strip_prefix("PRETTY_NAME=")?.trim_matches('"').to_owned()))
+/// The processor name out of /proc/cpuinfo, whose key is the architecture's
+/// business rather than this agent's: x86 kernels print `model name`, ARM ones
+/// `Processor`, and an ARM board that knows only its SoC prints `Hardware`. Any
+/// of them beats `unknown` on the panel.
+fn parse_cpu_name(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            matches!(k.trim(), "model name" | "Model" | "cpu model" | "Processor" | "Hardware")
+                .then(|| v.trim().to_owned())
         })
+        .filter(|n| !n.is_empty())
+}
+
+/// The board, for a kernel whose /proc/cpuinfo names no processor: a Synology
+/// DS223j prints only its MIDR fields there, while this file holds the string
+/// its owner recognises. The value is a device tree string property and ends in
+/// a NUL, which must not reach the panel.
+const DEVICE_TREE_MODEL: &str = "/proc/device-tree/model";
+
+fn os_pretty_name() -> String {
+    let read = |path: &str| fs::read_to_string(path).unwrap_or_default();
+    parse_os_name(&read("/etc/os-release"), &read("/etc/openwrt_release"), &read("/etc/VERSION"))
         .unwrap_or_else(|| "Linux".into())
+}
+
+/// The three files [`os_pretty_name`] reads, in the order they are trusted:
+/// os-release, an OpenWrt release file from before its kernels shipped
+/// os-release, and DSM's version file.
+fn parse_os_name(os_release: &str, openwrt_release: &str, dsm_version: &str) -> Option<String> {
+    assignment(os_release, "PRETTY_NAME")
+        .or_else(|| {
+            assignment(openwrt_release, "DISTRIB_DESCRIPTION").or_else(|| {
+                Some(format!(
+                    "{} {}",
+                    assignment(openwrt_release, "DISTRIB_ID")?,
+                    assignment(openwrt_release, "DISTRIB_RELEASE")?
+                ))
+            })
+        })
+        .or_else(|| {
+            let product = assignment(dsm_version, "productversion").or_else(|| {
+                Some(format!(
+                    "{}.{}",
+                    assignment(dsm_version, "majorversion")?,
+                    assignment(dsm_version, "minorversion")?
+                ))
+            })?;
+            Some(format!("Synology DSM {product}"))
+        })
+}
+
+/// One `KEY="value"` or `KEY=value` line of an os-release-style file, its value
+/// unquoted. The key is matched in full, so `VERSION_ID=` cannot answer for
+/// `VERSION=`.
+///
+/// Both quote styles are stripped because the two files disagree: os-release
+/// uses double quotes, while `/etc/openwrt_release` -- the source on an OpenWrt
+/// old enough to have no os-release at all -- writes `DISTRIB_ID='OpenWrt'`.
+/// Leaving the single quotes in puts them on the panel.
+fn assignment(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix(key)?.strip_prefix('=')?.trim().trim_matches(['"', '\'']);
+        (!value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 fn virtualization() -> String {
@@ -845,6 +962,83 @@ mod tests {
         assert_eq!(mem_used(&HashMap::new()), (0, 0));
     }
 
+    /// The keys are copied from real machines rather than invented: an x86
+    /// ImmortalWrt prints `model name`, an ARM Synology DS223j prints none of
+    /// the x86 keys at all and has to be named by its device tree instead, and
+    /// an ARM board without a device tree names its SoC under `Hardware`.
+    #[test]
+    fn the_processor_name_is_read_under_whichever_key_the_arch_uses() {
+        let x86 = "processor\t: 0\nmodel name\t: Intel(R) N100\ncpu cores\t: 4\n";
+        assert_eq!(parse_cpu_name(x86).as_deref(), Some("Intel(R) N100"));
+
+        let arm_board =
+            "processor\t: 0\nProcessor\t: ARMv7 Processor rev 4 (v7l)\nHardware\t: Marvell Armada 385\n";
+        assert_eq!(parse_cpu_name(arm_board).as_deref(), Some("ARMv7 Processor rev 4 (v7l)"));
+        assert_eq!(
+            parse_cpu_name("processor\t: 0\nHardware\t: Marvell Armada 385\n").as_deref(),
+            Some("Marvell Armada 385")
+        );
+
+        // A DS223j's whole cpuinfo: the MIDR fields and nothing naming the CPU.
+        let synology = "processor\t: 0\nBogoMIPS\t: 50.00\nCPU implementer\t: 0x41\nCPU architecture: 8\n";
+        assert_eq!(parse_cpu_name(synology), None, "the device tree is the answer here");
+        // A key present with no value names nothing either.
+        assert_eq!(parse_cpu_name("model name\t:\n"), None);
+        assert_eq!(parse_cpu_name(""), None);
+    }
+
+    /// What the panel shows for `os`, from the files the two machines this port
+    /// was written for actually have: ImmortalWrt 24.10 carries os-release, and
+    /// DSM 7.3 carries none of it and keeps /etc/VERSION.
+    #[test]
+    fn the_os_name_comes_from_os_release_or_dsm_version() {
+        let openwrt = "NAME=\"ImmortalWrt\"\nVERSION=\"24.10.5\"\nID=\"immortalwrt\"\n\
+                       PRETTY_NAME=\"ImmortalWrt 24.10.5\"\nVERSION_ID=\"24.10.5\"\n";
+        assert_eq!(
+            parse_os_name(openwrt, "", "").as_deref(),
+            Some("ImmortalWrt 24.10.5"),
+            "os-release is what every current distribution provides"
+        );
+        // VERSION_ID must not be mistaken for VERSION: the key is matched in full.
+        assert_eq!(assignment(openwrt, "VERSION").as_deref(), Some("24.10.5"));
+        assert_eq!(assignment(openwrt, "NAME").as_deref(), Some("ImmortalWrt"));
+        assert_eq!(assignment(openwrt, "ID").as_deref(), Some("immortalwrt"));
+        assert_eq!(assignment(openwrt, "ID_LIKE"), None);
+
+        // An older OpenWrt whose kernels shipped no os-release.
+        let release = "DISTRIB_ID='OpenWrt'\nDISTRIB_RELEASE='23.05.3'\n\
+                       DISTRIB_DESCRIPTION='OpenWrt 23.05.3 r23809-234f1a2efa'\n";
+        assert_eq!(
+            parse_os_name("", release, "").as_deref(),
+            Some("OpenWrt 23.05.3 r23809-234f1a2efa"),
+            "the description wins when the file has one"
+        );
+        assert_eq!(
+            parse_os_name("", "DISTRIB_ID='OpenWrt'\nDISTRIB_RELEASE='23.05.3'\n", "").as_deref(),
+            Some("OpenWrt 23.05.3")
+        );
+
+        // A DS223j: no os-release, and /etc/VERSION as the probe printed it.
+        let dsm = "majorversion=\"7\"\nminorversion=\"3\"\nmajor=\"7\"\nminor=\"3\"\n";
+        assert_eq!(parse_os_name("", "", dsm).as_deref(), Some("Synology DSM 7.3"));
+        // A field DSM adds on some versions, naming the same release.
+        let dsm = format!("{dsm}productversion=\"7.3.1\"\n");
+        assert_eq!(parse_os_name("", "", &dsm).as_deref(), Some("Synology DSM 7.3.1"));
+        // Half a version is no version: the panel says Linux as before.
+        assert_eq!(parse_os_name("", "", "majorversion=\"7\"\n"), None);
+        assert_eq!(parse_os_name("", "", ""), None);
+    }
+
+    /// `btime` is the boot id's stand-in, so it has to be read out of a
+    /// /proc/stat that also holds a `cpu` line starting with the same letters.
+    #[test]
+    fn the_boot_time_is_read_from_proc_stat() {
+        let stat = "cpu  1 2 3 4 5 6 7 8 9 10\ncpu0 1 2 3 4\nbtime 1790089382\nprocesses 18030\n";
+        assert_eq!(parse_btime(stat), Some(1790089382));
+        assert_eq!(parse_btime("cpu  1 2 3 4\n"), None);
+        assert_eq!(parse_btime(""), None);
+    }
+
     #[test]
     fn cpu_percent_needs_a_baseline_then_uses_deltas() {
         assert_eq!(parse_cpu_jiffies("cpu  40 0 35 925 0 0 0 0 0 0\n"), Some((1000, 925)));
@@ -911,12 +1105,31 @@ mod tests {
         assert_eq!(sum(dev, &Ifaces::default()), (1000, 2000));
     }
 
+    /// The interfaces that counted a second copy on the machines this port was
+    /// written for, without a synthetic /proc or a kernel fact to lean on: the
+    /// `dummy0` an OpenWrt image brings up (seen on ImmortalWrt 24.10 x86_64),
+    /// and the Open vSwitch pair a Synology DSM 7 host presents as `ovs_eth0`
+    /// and `ovs-system` around the physical port.
+    #[test]
+    fn the_virtual_devices_openwrt_and_dsm_present_are_not_a_second_count() {
+        let dev = "Inter-|   Receive\n face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n\
+                   eth0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+                 dummy0: 7777 1 0 0 0 0 0 0 7777 2 0 0 0 0 0 0\n\
+                ovs_eth0: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n\
+              ovs-system: 1000 1 0 0 0 0 0 0 2000 2 0 0 0 0 0 0\n";
+        assert_eq!(sum(dev, &Ifaces::default()), (1000, 2000));
+        // A listed interface still counts whatever the rules say, which is what
+        // a host whose only path to the wire is an OVS port relies on.
+        assert_eq!(sum(dev, &Ifaces::parse("ovs_eth0").unwrap()), (1000, 2000));
+        assert_eq!(sum(dev, &Ifaces::parse("-eth0").unwrap()), (0, 0));
+    }
+
     /// The two questions asked of an interface name, and why one list cannot
     /// answer both: a bridge's bytes are a duplicate, while a bridge's address
     /// may be this machine's only address.
     #[test]
     fn a_stacked_device_loses_its_bytes_but_keeps_its_address() {
-        for name in ["bond0", "br0", "vmbr0", "eth0.100", "vlan100", "pppoe-wan"] {
+        for name in ["bond0", "br0", "vmbr0", "eth0.100", "vlan100", "pppoe-wan", "ovs_eth0", "ovs-system"] {
             assert!(is_stacked(name), "{name}: the lower device already counted these bytes");
             assert!(!skip_iface(name), "{name} is where a host address lives");
         }
@@ -937,6 +1150,7 @@ mod tests {
             "erspan0",
             "lxc9f2c1e",
             "cilium_host",
+            "dummy0",
         ] {
             assert!(skip_iface(name), "{name} is not this machine");
         }
@@ -1160,6 +1374,80 @@ mod tests {
         // beneath it, so it passes the device check and carries a source of its
         // own past the dedup, while statvfs reports that filesystem again.
         assert_eq!(mounts, vec!["/", "/data", "/tank"]);
+    }
+
+    /// The two mount tables this port was written for, as the machines printed
+    /// them. Neither is guessed at, and each pins a decision that is easy to get
+    /// wrong later:
+    ///
+    /// - DSM 7.3 on a DS223j mounts one volume six times -- once at /volume1 and
+    ///   again for the Docker data, its btrfs subvolume and four container
+    ///   shares -- all with the same source, which the dedup is what collapses.
+    ///   It also counts `/dev/md0` (the 8 GB DSM system partition, always a
+    ///   sixth full) and a loop-mounted 27 MB ext4 image under /tmp. Counting the
+    ///   system partition and ignoring the image sizes is the intended reading:
+    ///   the panel is asked what the machine holds, not what its volumes do.
+    /// - ImmortalWrt 24.10 on x86_64 has no counted root at all: `/` is
+    ///   overlayfs over `/rom`'s squashfs, and the writable space is the f2fs
+    ///   `/overlay`, itself a loop device over the SATA disk. So a rule that
+    ///   skipped loop devices would report this machine as having no disk, while
+    ///   the same rule would only save the Synology 27 MB. The duplicate
+    ///   `/dev/sda1 /boot` rows and the second mount of that device at /mnt/sda1
+    ///   are collapsed by the source dedup.
+    #[test]
+    fn the_synology_and_openwrt_mount_tables_yield_one_row_per_device() {
+        let dsm = "/dev/md0 / ext4 rw 0 0\n\
+                   sysfs /sys sysfs rw 0 0\n\
+                   proc /proc proc rw 0 0\n\
+                   devtmpfs /dev devtmpfs rw 0 0\n\
+                   securityfs /sys/kernel/security securityfs rw 0 0\n\
+                   tmpfs /dev/shm tmpfs rw 0 0\n\
+                   devpts /dev/pts devpts rw 0 0\n\
+                   tmpfs /run tmpfs rw 0 0\n\
+                   tmpfs /sys/fs/cgroup tmpfs rw 0 0\n\
+                   cgroup /sys/fs/cgroup/synomonitor cgroup rw 0 0\n\
+                   cgroup /sys/fs/cgroup/memory cgroup rw 0 0\n\
+                   debugfs /sys/kernel/debug debugfs rw 0 0\n\
+                   tmpfs /tmp tmpfs rw 0 0\n\
+                   devtmpfs /proc/bus/usb devtmpfs rw 0 0\n\
+                   configfs /sys/kernel/config configfs rw 0 0\n\
+                   nfsd /proc/fs/nfsd nfsd rw 0 0\n\
+                   sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw 0 0\n\
+                   /dev/loop0 /tmp/SynologyAuthService ext4 rw 0 0\n\
+                   /dev/vg1/volume_1 /volume1 btrfs rw 0 0\n\
+                   none /config configfs rw 0 0\n\
+                   fusectl /sys/fs/fuse/connections fusectl rw 0 0\n\
+                   /dev/vg1/volume_1 /volume1/@docker btrfs rw 0 0\n\
+                   /dev/vg1/volume_1 /volume1/@docker/btrfs btrfs rw 0 0\n\
+                   nsfs /run/docker/netns/6529d4c543c6 nsfs rw 0 0\n\
+                   /dev/vg1/volume_1 /volume1/@appdata/ContainerManager/all_shares/photo btrfs rw 0 0\n";
+        let dsm = parse_mounts(dsm);
+        assert_eq!(dsm, vec!["/", "/tmp/SynologyAuthService", "/volume1"]);
+        // What the panel is asked about is the volumes, not the OS partition:
+        // dropping `/` is the whole of the DSM rule, and it takes nothing else.
+        assert_eq!(storage_mounts(dsm, true), vec!["/tmp/SynologyAuthService", "/volume1"]);
+        // A host with no /usr/syno keeps every filesystem it has, root included.
+        assert_eq!(storage_mounts(vec!["/".to_owned()], false), vec!["/"]);
+
+        let openwrt = "/dev/root /rom squashfs ro 0 0\n\
+                       proc /proc proc rw 0 0\n\
+                       sysfs /sys sysfs rw 0 0\n\
+                       cgroup2 /sys/fs/cgroup cgroup2 rw 0 0\n\
+                       tmpfs /tmp tmpfs rw 0 0\n\
+                       /dev/loop0 /overlay f2fs rw 0 0\n\
+                       overlayfs:/overlay / overlay rw 0 0\n\
+                       /dev/sda1 /boot ext4 rw 0 0\n\
+                       /dev/sda1 /boot ext4 rw 0 0\n\
+                       tmpfs /dev tmpfs rw 0 0\n\
+                       devpts /dev/pts devpts rw 0 0\n\
+                       /dev/sda1 /mnt/sda1 ext4 rw 0 0\n\
+                       debugfs /sys/kernel/debug debugfs rw 0 0\n\
+                       bpffs /sys/fs/bpf bpf rw 0 0\n";
+        let openwrt = parse_mounts(openwrt);
+        assert_eq!(openwrt, vec!["/overlay", "/boot"]);
+        // OpenWrt's counted set has no `/` in it to begin with, and lives on a
+        // loop device, so neither rule may be applied to it by name.
+        assert_eq!(storage_mounts(openwrt, false), vec!["/overlay", "/boot"]);
     }
 
     /// `install.sh` runs this agent with `ProtectHome=yes`, which systemd
